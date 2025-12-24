@@ -39,6 +39,20 @@ class PreProcessor():
         except:
             return np.nan
     
+    def customImputation(self, df, col:str, impute_type:str):
+        df[col + "_imputed_flag"] = df[col].isna().astype(int)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        if impute_type == "zero":
+            df[col] = df[col].fillna(0)
+
+        elif impute_type == "firm_mean":
+            if "PERMNO" not in df.columns:
+                raise ValueError("firm_mean imputation requires a PERMNO column.")
+            df[col] = df.groupby("PERMNO")[col].transform(lambda s: s.fillna(s.mean()))
+            df[col] = df[col].fillna(0)
+        return df
+    
     def read_data(self):
         bankruptcy = pd.read_csv('data/BANKRUPTCY.csv', dtype = self.bankruptcy_config, parse_dates=['B_date']) # type: ignore
         compustat = pd.read_csv('data/COMPUSTAT.csv')
@@ -85,4 +99,11 @@ class PreProcessor():
         df['bankruptcy'] = (df['bk_year'].notna()).astype(int)
         df = df.drop(columns=['bk_year', 'B_date', 'cusip'])
         df = df.dropna(subset=['year', 'PERMNO'])
+        required = ['PRC', 'RET','vwretd','at','lt','ceq', 'dltt','sale','ni','gp','che','xint','rect','invt','ebit','lct','capx','act']
+        df = df.dropna(subset=required)
+        
+        df = self.customImputation(df, 'oancf', 'firm_mean')
+        df = self.customImputation(df, 'fincf', 'firm_mean')
+        df = self.customImputation(df, 'ivncf', 'firm_mean')
+        df = self.customImputation(df, 'dv', 'zero')
         return df
