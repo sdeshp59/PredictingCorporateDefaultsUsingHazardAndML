@@ -2,6 +2,7 @@ lightgbm
 matplotlib
 numpy
 pandas
+pytest
 scikit-learn
 scikit-survival
 xgboost
