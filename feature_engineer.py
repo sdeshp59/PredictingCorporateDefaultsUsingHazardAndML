@@ -79,17 +79,19 @@ class FeatureEngineer():
         Y = df['bankruptcy']
         year = extract_year_series(X)
         train_mask = (year >= 1964) & (year <= 1990)
-        test_mask  = (year >= 1991) & (year <= 2020)
+        val_mask = (year >= 1991) & (year <= 2000)
+        test_mask  = (year >= 2001) & (year <= 2020)
 
-        years_test = np.arange(1991, 2021)
+        years_test = np.arange(2001, 2021)
 
         X_train, Y_train = X.loc[train_mask, :], Y.loc[train_mask]
+        X_val, Y_val = X.loc[val_mask, :], Y.loc[val_mask]
         X_test, Y_test = X.loc[test_mask, :],  Y.loc[test_mask]
-        return X_train, X_test, Y_train, Y_test
+        return X_train, X_val, X_test, Y_train, Y_val, Y_test
     
     def run(self, df):
         df = self.derive_features(df)
         df = self.distance_to_default(df)
         df = self.sanitize_columns(df)
-        X_train, X_test, Y_train, Y_test = self.split_data(df)
-        return X_train, X_test, Y_train, Y_test 
+        X_train, X_val, X_test, Y_train, Y_val, Y_test = self.split_data(df)
+        return X_train, X_val, X_test, Y_train, Y_val, Y_test 
