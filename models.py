@@ -759,40 +759,29 @@ class ModelPipeline:
         return self.results.copy()
 
     def fit_all_models(self) -> None:
-        print("Fitting Logistic Regression models")
         for mode in ['plain', 'rolling', 'fixed']:
             self.fit_logistic_regression(mode=mode)
             gc.collect()
 
-        print("Fitting LASSO Logistic models")
         for mode in ['plain', 'rolling', 'fixed']:
             self.fit_lasso_logistic(mode=mode)
             gc.collect()
 
-        print("Fitting Ridge Logistic models")
         for mode in ['plain', 'rolling', 'fixed']:
             self.fit_ridge_logistic(mode=mode)
             gc.collect()
 
-        print("Fitting KNN")
         self.fit_knn()
         gc.collect()
 
-        print("Fitting Random Forest")
         self.fit_random_forest()
         gc.collect()
 
-        print("Fitting Survival Random Forest")
-        try:
-            self.fit_survival_random_forest()
-        except ValueError as e:
-            print(f"  Skipping Survival RF: {e}")
+        self.fit_survival_random_forest()
         gc.collect()
 
-        print("Fitting XGBoost")
         self.fit_xgboost()
         gc.collect()
 
-        print("Fitting LightGBM")
         self.fit_lightgbm()
         gc.collect()
