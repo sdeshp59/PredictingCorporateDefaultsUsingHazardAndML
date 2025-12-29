@@ -12,34 +12,51 @@ from sksurv.util import Surv
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from typing import Dict, List, Tuple, Optional
+import gc
 
 
 class ModelPipeline:
     def __init__(self, X_train, X_val, X_test, Y_train, Y_val, Y_test, random_state: int = 42):
         self.random_state = random_state
-
+    
         self.models = {}
         self.results = pd.DataFrame(columns=['name', 'auc', 'ks', 'misclassification_rate'])
         self.predictions = {}
-
-        self.X_train = X_train
-        self.X_val = X_val
-        self.X_test = X_test
+    
+        self.permno_train = X_train['PERMNO']
+        self.permno_val = X_val['PERMNO']
+        self.permno_test = X_test['PERMNO']
+        
+        self.year_train = X_train['year']
+        self.year_val = X_val['year']
+        self.year_test = X_test['year']
+        
+        feature_cols = [col for col in X_train.columns if col not in ['PERMNO', 'year']]
+        self.X_train = X_train[feature_cols]
+        self.X_val = X_val[feature_cols]
+        self.X_test = X_test[feature_cols]
+        
         self.y_train = Y_train
         self.y_val = Y_val
         self.y_test = Y_test
-
+    
         self.train_start = 1964
         self.train_end = 1990
         self.val_start = 1991
         self.val_end = 2000
         self.test_start = 2001
         self.test_end = 2020
-
-        self.full_X = pd.concat([X_train, X_val, X_test], axis=0)
-        self.full_y = pd.concat([Y_train, Y_val, Y_test], axis=0)
-
-        self.year = self.full_X['year'].astype(int)
+    
+        full_permno = pd.concat([self.permno_train, self.permno_val, self.permno_test], axis=0, copy=False)
+        full_year = pd.concat([self.year_train, self.year_val, self.year_test], axis=0, copy=False)
+        full_features = pd.concat([self.X_train, self.X_val, self.X_test], axis=0, copy=False)
+        
+        self.full_X = full_features.copy()
+        self.full_X['PERMNO'] = full_permno.values
+        self.full_X['year'] = full_year.values
+        
+        self.full_y = pd.concat([Y_train, Y_val, Y_test], axis=0, copy=False)
+        self.year = self.full_X['year'].astype('int16')
 
     def _make_logit_pipeline(self, class_weight: Optional[str] = None, max_iter: int = 1000
                             ,solver: str = "lbfgs") -> Pipeline:
@@ -54,6 +71,10 @@ class ModelPipeline:
             ))
         ])
 
+    def _get_feature_columns(self):
+        """Get feature columns excluding identifiers"""
+        return [col for col in self.full_X.columns if col not in ['PERMNO', 'year', 'event', 'duration']] # type: ignore
+    
     def fit_logistic_regression(self, mode: str = 'plain',
                                 window_length: Optional[int] = None) -> None:
         
@@ -79,96 +100,115 @@ class ModelPipeline:
 
     def _fit_rolling_window_logit(self) -> None:
         years_test = np.arange(self.test_start, self.test_end + 1)
-        roll_rows = []
-
+    
+        n_test = (self.year >= self.test_start).sum()
+        all_proba = np.zeros(n_test)
+        all_y = np.zeros(n_test)
+        idx = 0
+        
+        feature_cols = self._get_feature_columns()
+    
         for t in years_test:
             tr_mask_t = (self.year >= self.train_start) & (self.year <= t - 1)
             te_mask_t = (self.year == t)
-
-            if te_mask_t.sum() == 0:
+    
+            n_t = te_mask_t.sum()
+            if n_t == 0:
                 continue
-
+    
             pipe = self._make_logit_pipeline()
-            pipe.fit(self.full_X.loc[tr_mask_t, :], self.full_y.loc[tr_mask_t])
-
-            p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, :])[:, 1]
-            roll_rows.append(pd.DataFrame({
-                "year": self.year.loc[te_mask_t].values,
-                "proba": p_t,
-                "y": self.full_y.loc[te_mask_t].values
-            }))
-
-        roll_oos = pd.concat(roll_rows, ignore_index=True) if roll_rows else pd.DataFrame()
-        self.predictions['Logistic: Rolling Window'] = roll_oos["proba"].values
-        self._summarize_model('Logistic: Rolling Window', roll_oos["y"].values, roll_oos["proba"].values) # type: ignore
+            pipe.fit(self.full_X.loc[tr_mask_t, feature_cols], self.full_y.loc[tr_mask_t])
+    
+            p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, feature_cols])[:, 1]
+    
+            all_proba[idx:idx+n_t] = p_t
+            all_y[idx:idx+n_t] = self.full_y.loc[te_mask_t].values
+            idx += n_t
+    
+            del pipe
+            gc.collect()
+    
+        self.predictions['Logistic: Rolling Window'] = all_proba[:idx]
+        self._summarize_model('Logistic: Rolling Window', all_y[:idx], all_proba[:idx])
 
     def _fit_fixed_window_logit(self, window_length: int) -> None:
         years_test = np.arange(self.test_start, self.test_end + 1)
-        fix_rows = []
-
+    
+        n_test = (self.year >= self.test_start).sum()
+        all_proba = np.zeros(n_test)
+        all_y = np.zeros(n_test)
+        idx = 0
+        
+        feature_cols = self._get_feature_columns()
+    
         for t in years_test:
             tr_end = t - 1
             tr_start = tr_end - window_length + 1
             tr_mask_t = (self.year >= tr_start) & (self.year <= tr_end)
             te_mask_t = (self.year == t)
-
-            if tr_mask_t.sum() == 0 or te_mask_t.sum() == 0:
+    
+            n_t = te_mask_t.sum()
+            if tr_mask_t.sum() == 0 or n_t == 0:
                 continue
-
+    
             pipe = self._make_logit_pipeline()
-            pipe.fit(self.full_X.loc[tr_mask_t, :], self.full_y.loc[tr_mask_t])
-
-            p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, :])[:, 1]
-            fix_rows.append(pd.DataFrame({
-                "year": self.year.loc[te_mask_t].values,
-                "proba": p_t,
-                "y": self.full_y.loc[te_mask_t].values
-            }))
-
-        fix_oos = pd.concat(fix_rows, ignore_index=True) if fix_rows else pd.DataFrame()
-        self.predictions['Logistic: Fixed Window'] = fix_oos["proba"].values
-        self._summarize_model('Logistic: Fixed Window', fix_oos["y"].values, fix_oos["proba"].values) # type: ignore
+            pipe.fit(self.full_X.loc[tr_mask_t, feature_cols], self.full_y.loc[tr_mask_t])
+    
+            p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, feature_cols])[:, 1]
+    
+            all_proba[idx:idx+n_t] = p_t
+            all_y[idx:idx+n_t] = self.full_y.loc[te_mask_t].values
+            idx += n_t
+    
+            del pipe
+            gc.collect()
+    
+        self.predictions['Logistic: Fixed Window'] = all_proba[:idx]
+        self._summarize_model('Logistic: Fixed Window', all_y[:idx], all_proba[:idx])
 
     def fit_lasso_logistic(self, mode: str = 'plain', alphas: Optional[np.ndarray] = None, 
-                           window_length: Optional[int] = None) -> None:
+                       window_length: Optional[int] = None) -> None:
         if alphas is None:
             alphas = np.logspace(-4, 1, 40)
-
+    
         combined_mask = (self.year >= self.train_start) & (self.year <= self.val_end)
-        X_combined = self.full_X.loc[combined_mask, :]
+        
+        # Get only feature columns for LASSO selection
+        feature_cols = self._get_feature_columns()
+        X_combined = self.full_X.loc[combined_mask, feature_cols]
         y_combined = self.full_y.loc[combined_mask]
-
+    
         lasso_pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("lasso", LassoCV(alphas=alphas, cv=10, random_state=self.random_state, n_jobs=-1))
         ])
-
+    
         lasso_pipe.fit(X_combined, y_combined.astype(float))
         coef = lasso_pipe.named_steps["lasso"].coef_
         selected_mask = (coef != 0)
         selected_features = list(X_combined.columns[selected_mask])
-
+    
         if len(selected_features) == 0:
             k = min(10, len(coef))
             topk_idx = np.argsort(np.abs(coef))[-k:]
             selected_features = list(X_combined.columns[topk_idx])
         else:
-            print(f"LASSO selected {len(selected_features)} features")
-
+            pass
+    
         self.selected_features_lasso = selected_features
-
+    
         if mode == 'plain':
             pipe = self._make_logit_pipeline()
             pipe.fit(self.X_train.loc[:, selected_features], self.y_train)
-
+    
             y_pred = pipe.predict_proba(self.X_test.loc[:, selected_features])[:, 1]
             self.models['Post-LASSO Logistic: Plain OOS'] = pipe
             self.predictions['Post-LASSO Logistic: Plain OOS'] = y_pred
             self._summarize_model('Post-LASSO Logistic: Plain OOS', self.y_test, y_pred)
-
+    
         elif mode == 'rolling':
             self._fit_rolling_window_lasso(selected_features)
-
+    
         elif mode == 'fixed':
             if window_length is None:
                 window_length = self.train_end - self.train_start + 1
@@ -176,77 +216,91 @@ class ModelPipeline:
 
     def _fit_rolling_window_lasso(self, selected_features: List[str]) -> None:
         years_test = np.arange(self.test_start, self.test_end + 1)
-        roll_rows = []
-
+    
+        n_test = (self.year >= self.test_start).sum()
+        all_proba = np.zeros(n_test)
+        all_y = np.zeros(n_test)
+        idx = 0
+    
         for t in years_test:
             tr_mask_t = (self.year >= self.train_start) & (self.year <= t - 1)
             te_mask_t = (self.year == t)
-
-            if te_mask_t.sum() == 0:
+    
+            n_t = te_mask_t.sum()
+            if n_t == 0:
                 continue
-
+    
             pipe = self._make_logit_pipeline()
             pipe.fit(self.full_X.loc[tr_mask_t, selected_features], self.full_y.loc[tr_mask_t])
-
+    
             p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, selected_features])[:, 1]
-            roll_rows.append(pd.DataFrame({
-                "year": self.year.loc[te_mask_t].values,
-                "proba": p_t,
-                "y": self.full_y.loc[te_mask_t].values
-            }))
-
-        roll_oos = pd.concat(roll_rows, ignore_index=True) if roll_rows else pd.DataFrame()
-        self.predictions['Post-LASSO Logistic: Rolling Window'] = roll_oos["proba"].values
-        self._summarize_model('Post-LASSO Logistic: Rolling Window', roll_oos["y"].values, roll_oos["proba"].values) # type: ignore
+    
+            all_proba[idx:idx+n_t] = p_t
+            all_y[idx:idx+n_t] = self.full_y.loc[te_mask_t].values
+            idx += n_t
+    
+            del pipe
+            gc.collect()
+    
+        self.predictions['Post-LASSO Logistic: Rolling Window'] = all_proba[:idx]
+        self._summarize_model('Post-LASSO Logistic: Rolling Window', all_y[:idx], all_proba[:idx])
 
     def _fit_fixed_window_lasso(self, selected_features: List[str], window_length: int) -> None:
         years_test = np.arange(self.test_start, self.test_end + 1)
-        fix_rows = []
-
+    
+        n_test = (self.year >= self.test_start).sum()
+        all_proba = np.zeros(n_test)
+        all_y = np.zeros(n_test)
+        idx = 0
+    
         for t in years_test:
             tr_end = t - 1
             tr_start = tr_end - window_length + 1
             tr_mask_t = (self.year >= tr_start) & (self.year <= tr_end)
             te_mask_t = (self.year == t)
-
-            if tr_mask_t.sum() == 0 or te_mask_t.sum() == 0:
+    
+            n_t = te_mask_t.sum()
+            if tr_mask_t.sum() == 0 or n_t == 0:
                 continue
-
+    
             pipe = self._make_logit_pipeline()
             pipe.fit(self.full_X.loc[tr_mask_t, selected_features], self.full_y.loc[tr_mask_t])
-
+    
             p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, selected_features])[:, 1]
-            fix_rows.append(pd.DataFrame({
-                "year": self.year.loc[te_mask_t].values,
-                "proba": p_t,
-                "y": self.full_y.loc[te_mask_t].values
-            }))
-
-        fix_oos = pd.concat(fix_rows, ignore_index=True) if fix_rows else pd.DataFrame()
-        self.predictions['Post-LASSO Logistic: Fixed Window'] = fix_oos["proba"].values
-        self._summarize_model('Post-LASSO Logistic: Fixed Window', fix_oos["y"].values, fix_oos["proba"].values) # type: ignore
+    
+            all_proba[idx:idx+n_t] = p_t
+            all_y[idx:idx+n_t] = self.full_y.loc[te_mask_t].values
+            idx += n_t
+    
+            del pipe
+            gc.collect()
+    
+        self.predictions['Post-LASSO Logistic: Fixed Window'] = all_proba[:idx]
+        self._summarize_model('Post-LASSO Logistic: Fixed Window', all_y[:idx], all_proba[:idx])
 
     def fit_ridge_logistic(self, mode: str = 'plain', alphas: Optional[np.ndarray] = None, 
-                           window_length: Optional[int] = None) -> None:
-        
+                       window_length: Optional[int] = None) -> None:
+    
         if alphas is None:
             alphas = np.logspace(-4, 1, 40)
-
-        selected_features = list(self.X_train.columns)
+    
+        # Get only feature columns (exclude PERMNO and year)
+        feature_cols = self._get_feature_columns()
+        selected_features = feature_cols
         self.selected_features_ridge = selected_features
-
+    
         if mode == 'plain':
             pipe = self._make_logit_pipeline()
             pipe.fit(self.X_train.loc[:, selected_features], self.y_train)
-
+    
             y_pred = pipe.predict_proba(self.X_test.loc[:, selected_features])[:, 1]
             self.models['Post-Ridge Logistic: Plain OOS'] = pipe
             self.predictions['Post-Ridge Logistic: Plain OOS'] = y_pred
             self._summarize_model('Post-Ridge Logistic: Plain OOS', self.y_test, y_pred)
-
+    
         elif mode == 'rolling':
             self._fit_rolling_window_ridge(selected_features)
-
+    
         elif mode == 'fixed':
             if window_length is None:
                 window_length = self.train_end - self.train_start + 1
@@ -254,64 +308,75 @@ class ModelPipeline:
 
     def _fit_rolling_window_ridge(self, selected_features: List[str]) -> None:
         years_test = np.arange(self.test_start, self.test_end + 1)
-        roll_rows = []
-
+    
+        n_test = (self.year >= self.test_start).sum()
+        all_proba = np.zeros(n_test)
+        all_y = np.zeros(n_test)
+        idx = 0
+    
         for t in years_test:
             tr_mask_t = (self.year >= self.train_start) & (self.year <= t - 1)
             te_mask_t = (self.year == t)
-
-            if te_mask_t.sum() == 0:
+    
+            n_t = te_mask_t.sum()
+            if n_t == 0:
                 continue
-
+    
             pipe = self._make_logit_pipeline()
             pipe.fit(self.full_X.loc[tr_mask_t, selected_features], self.full_y.loc[tr_mask_t])
-
+    
             p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, selected_features])[:, 1]
-            roll_rows.append(pd.DataFrame({
-                "year": self.year.loc[te_mask_t].values,
-                "proba": p_t,
-                "y": self.full_y.loc[te_mask_t].values
-            }))
-
-        roll_oos = pd.concat(roll_rows, ignore_index=True) if roll_rows else pd.DataFrame()
-        self.predictions['Post-Ridge Logistic: Rolling Window'] = roll_oos["proba"].values
-        self._summarize_model('Post-Ridge Logistic: Rolling Window', roll_oos["y"].values, roll_oos["proba"].values) # type: ignore
+    
+            all_proba[idx:idx+n_t] = p_t
+            all_y[idx:idx+n_t] = self.full_y.loc[te_mask_t].values
+            idx += n_t
+    
+            del pipe
+            gc.collect()
+    
+        self.predictions['Post-Ridge Logistic: Rolling Window'] = all_proba[:idx]
+        self._summarize_model('Post-Ridge Logistic: Rolling Window', all_y[:idx], all_proba[:idx])
 
     def _fit_fixed_window_ridge(self, selected_features: List[str], window_length: int) -> None:
         years_test = np.arange(self.test_start, self.test_end + 1)
-        fix_rows = []
-
+    
+        n_test = (self.year >= self.test_start).sum()
+        all_proba = np.zeros(n_test)
+        all_y = np.zeros(n_test)
+        idx = 0
+    
         for t in years_test:
             tr_end = t - 1
             tr_start = tr_end - window_length + 1
             tr_mask_t = (self.year >= tr_start) & (self.year <= tr_end)
             te_mask_t = (self.year == t)
-
-            if tr_mask_t.sum() == 0 or te_mask_t.sum() == 0:
+    
+            n_t = te_mask_t.sum()
+            if tr_mask_t.sum() == 0 or n_t == 0:
                 continue
-
+    
             pipe = self._make_logit_pipeline()
             pipe.fit(self.full_X.loc[tr_mask_t, selected_features], self.full_y.loc[tr_mask_t])
-
+    
             p_t = pipe.predict_proba(self.full_X.loc[te_mask_t, selected_features])[:, 1]
-            fix_rows.append(pd.DataFrame({
-                "year": self.year.loc[te_mask_t].values,
-                "proba": p_t,
-                "y": self.full_y.loc[te_mask_t].values
-            }))
-
-        fix_oos = pd.concat(fix_rows, ignore_index=True) if fix_rows else pd.DataFrame()
-        self.predictions['Post-Ridge Logistic: Fixed Window'] = fix_oos["proba"].values
-        self._summarize_model('Post-Ridge Logistic: Fixed Window', fix_oos["y"].values, fix_oos["proba"].values) # type: ignore
+    
+            all_proba[idx:idx+n_t] = p_t
+            all_y[idx:idx+n_t] = self.full_y.loc[te_mask_t].values
+            idx += n_t
+    
+            del pipe
+            gc.collect()
+    
+        self.predictions['Post-Ridge Logistic: Fixed Window'] = all_proba[:idx]
+        self._summarize_model('Post-Ridge Logistic: Fixed Window', all_y[:idx], all_proba[:idx])
 
     def fit_knn(self, k_values: Optional[List[int]] = None) -> None:
-        
         if k_values is None:
             k_values = list(range(1, 10))
-
+    
         best_k = None
         best_mis_rate = float('inf')
-
+    
         for k in k_values:
             pipe = Pipeline([
                 ("scaler", StandardScaler()),
@@ -320,38 +385,39 @@ class ModelPipeline:
             pipe.fit(self.X_train, self.y_train)
             y_pred = pipe.predict(self.X_val)
             mis_rate = (y_pred != self.y_val).mean()
-
+    
             if mis_rate < best_mis_rate:
                 best_mis_rate = mis_rate
                 best_k = k
-
+    
         combined_mask = (self.year >= self.train_start) & (self.year <= self.val_end)
-        X_combined = self.full_X.loc[combined_mask, :]
+        feature_cols = self._get_feature_columns()
+        X_combined = self.full_X.loc[combined_mask, feature_cols]
         y_combined = self.full_y.loc[combined_mask]
-
+    
         best_pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("knn", KNeighborsClassifier(n_neighbors=best_k)) # type: ignore
         ])
         best_pipe.fit(X_combined, y_combined)
-
+    
         y_pred_proba = best_pipe.predict_proba(self.X_test)[:, 1]
-
+    
         model_name = f'KNN (K={best_k})'
         self.models[model_name] = best_pipe
         self.predictions[model_name] = y_pred_proba
         self._summarize_model(model_name, self.y_test, y_pred_proba)
 
     def fit_random_forest(self, n_estimators_list: Optional[List[int]] = None, 
-                          max_depth_list: Optional[List] = None) -> None:
+                      max_depth_list: Optional[List] = None) -> None:
         if n_estimators_list is None:
             n_estimators_list = [50, 100, 200, 300]
         if max_depth_list is None:
             max_depth_list = [3, 5, 10, None]
-
+    
         best_params = None
         best_mis_rate = float('inf')
-
+    
         for n in n_estimators_list:
             for d in max_depth_list:
                 rf = RandomForestClassifier(
@@ -363,15 +429,16 @@ class ModelPipeline:
                 rf.fit(self.X_train, self.y_train)
                 y_pred = rf.predict(self.X_val)
                 mis_rate = (y_pred != self.y_val).mean()
-
+    
                 if mis_rate < best_mis_rate:
                     best_mis_rate = mis_rate
                     best_params = {'n_estimators': n, 'max_depth': d}
-
+    
         combined_mask = (self.year >= self.train_start) & (self.year <= self.val_end)
-        X_combined = self.full_X.loc[combined_mask, :]
+        feature_cols = self._get_feature_columns()
+        X_combined = self.full_X.loc[combined_mask, feature_cols]
         y_combined = self.full_y.loc[combined_mask]
-
+    
         best_rf = RandomForestClassifier(
             n_estimators=best_params['n_estimators'], # type: ignore
             max_depth=best_params['max_depth'], # type: ignore
@@ -379,9 +446,9 @@ class ModelPipeline:
             n_jobs=-1
         )
         best_rf.fit(X_combined, y_combined)
-
+    
         y_pred_proba = best_rf.predict_proba(self.X_test)[:, 1]
-
+    
         model_name = f"Random Forest (n={best_params['n_estimators']}, depth={best_params['max_depth']})" # type: ignore
         self.models[model_name] = best_rf
         self.predictions[model_name] = y_pred_proba
@@ -389,18 +456,18 @@ class ModelPipeline:
 
     def fit_survival_random_forest(self, n_estimators_list: Optional[List[int]] = None) -> None:
         self._prepare_survival_data()
-
+    
         if n_estimators_list is None:
             n_estimators_list = [50, 75, 100]
-
+    
         y_surv_train = Surv.from_arrays(
             event=self.event_train,
             time=self.duration_train
         )
-
+    
         best_n = None
         best_mis_rate = float('inf')
-
+    
         for n in n_estimators_list:
             rsf = RandomSurvivalForest(
                 n_estimators=n,
@@ -413,23 +480,24 @@ class ModelPipeline:
             )
             rsf.fit(self.X_train, y_surv_train)
             y_score = rsf.predict(self.X_val).astype(float)
-
+    
             _, mis = self._best_cutoff_misrate_survival(self.y_val.values, y_score)
-
+    
             if mis < best_mis_rate:
                 best_mis_rate = mis
                 best_n = n
         
         combined_mask = (self.year >= self.train_start) & (self.year <= self.val_end)
-        X_combined = self.full_X.loc[combined_mask, :]
+        feature_cols = self._get_feature_columns()
+        X_combined = self.full_X.loc[combined_mask, feature_cols]
         event_combined = self.full_event.loc[combined_mask]
         duration_combined = self.full_duration.loc[combined_mask]
-
+    
         y_surv_combined = Surv.from_arrays(
             event=event_combined,
             time=duration_combined
         )
-
+    
         best_rsf = RandomSurvivalForest(
             n_estimators=best_n, # type: ignore
             max_features="sqrt",
@@ -439,9 +507,9 @@ class ModelPipeline:
             n_jobs=-1
         )
         best_rsf.fit(X_combined, y_surv_combined)
-
+    
         y_score_test = best_rsf.predict(self.X_test).astype(float)
-
+    
         model_name = f'Survival RF (n={best_n})'
         self.models[model_name] = best_rsf
         self.predictions[model_name] = y_score_test
@@ -494,14 +562,14 @@ class ModelPipeline:
         self.duration_test = self.full_duration.loc[test_mask].to_numpy()
 
     def fit_xgboost(self, n_estimators_list: Optional[List[int]] = None, max_depth: int = 3, 
-                    learning_rate: float = 0.1) -> None:
-        
+                learning_rate: float = 0.1) -> None:
+    
         if n_estimators_list is None:
             n_estimators_list = [50, 100, 200, 300]
-
+    
         best_n = None
         best_mis_rate = float('inf')
-
+    
         for n_rounds in n_estimators_list:
             xgb = XGBClassifier(
                 n_estimators=n_rounds,
@@ -514,19 +582,20 @@ class ModelPipeline:
                 eval_metric="logloss"
             )
             xgb.fit(self.X_train, self.y_train)
-
+    
             y_prob = xgb.predict_proba(self.X_val)[:, 1]
             _, mis = self._best_cutoff_misrate(self.y_val.values, y_prob)
-
+    
             if mis < best_mis_rate:
                 best_mis_rate = mis
                 best_n = n_rounds
-
+    
         
         combined_mask = (self.year >= self.train_start) & (self.year <= self.val_end)
-        X_combined = self.full_X.loc[combined_mask, :]
+        feature_cols = self._get_feature_columns()
+        X_combined = self.full_X.loc[combined_mask, feature_cols]
         y_combined = self.full_y.loc[combined_mask]
-
+    
         best_xgb = XGBClassifier(
             n_estimators=best_n,
             max_depth=max_depth,
@@ -538,22 +607,22 @@ class ModelPipeline:
             eval_metric="logloss"
         )
         best_xgb.fit(X_combined, y_combined)
-
+    
         y_pred_proba = best_xgb.predict_proba(self.X_test)[:, 1]
-
+    
         model_name = f'XGBoost (n={best_n})'
         self.models[model_name] = best_xgb
         self.predictions[model_name] = y_pred_proba
         self._summarize_model(model_name, self.y_test, y_pred_proba)
 
     def fit_lightgbm(self, max_depth_list: Optional[List[int]] = None, n_estimators: int = 300, 
-                     learning_rate: float = 0.05) -> None:
+                 learning_rate: float = 0.05) -> None:
         if max_depth_list is None:
             max_depth_list = [-1, 3, 5, 7, 9]
-
+    
         best_md = None
         best_mis_rate = float('inf')
-
+    
         for md in max_depth_list:
             lgbm = LGBMClassifier(
                 objective="binary",
@@ -568,18 +637,19 @@ class ModelPipeline:
                 verbose=-1
             )
             lgbm.fit(self.X_train, self.y_train)
-
+    
             y_prob = lgbm.predict_proba(self.X_val)[:, 1] # type: ignore
             _, mis = self._best_cutoff_misrate(self.y_val.values, y_prob)
-
+    
             if mis < best_mis_rate:
                 best_mis_rate = mis
                 best_md = md
         
         combined_mask = (self.year >= self.train_start) & (self.year <= self.val_end)
-        X_combined = self.full_X.loc[combined_mask, :]
+        feature_cols = self._get_feature_columns()
+        X_combined = self.full_X.loc[combined_mask, feature_cols]
         y_combined = self.full_y.loc[combined_mask]
-
+    
         best_lgbm = LGBMClassifier(
             objective="binary",
             max_depth=best_md, # type: ignore
@@ -592,9 +662,9 @@ class ModelPipeline:
             verbose=-1
         )
         best_lgbm.fit(X_combined, y_combined)
-
+    
         y_pred_proba = best_lgbm.predict_proba(self.X_test)[:, 1] # type: ignore
-
+    
         model_name = f'LightGBM (depth={best_md})'
         self.models[model_name] = best_lgbm
         self.predictions[model_name] = y_pred_proba
@@ -689,24 +759,40 @@ class ModelPipeline:
         return self.results.copy()
 
     def fit_all_models(self) -> None:
+        print("Fitting Logistic Regression models")
         for mode in ['plain', 'rolling', 'fixed']:
             self.fit_logistic_regression(mode=mode)
+            gc.collect()
 
+        print("Fitting LASSO Logistic models")
         for mode in ['plain', 'rolling', 'fixed']:
             self.fit_lasso_logistic(mode=mode)
+            gc.collect()
 
+        print("Fitting Ridge Logistic models")
         for mode in ['plain', 'rolling', 'fixed']:
             self.fit_ridge_logistic(mode=mode)
+            gc.collect()
 
+        print("Fitting KNN")
         self.fit_knn()
+        gc.collect()
 
+        print("Fitting Random Forest")
         self.fit_random_forest()
+        gc.collect()
 
+        print("Fitting Survival Random Forest")
         try:
             self.fit_survival_random_forest()
         except ValueError as e:
             print(f"  Skipping Survival RF: {e}")
+        gc.collect()
 
+        print("Fitting XGBoost")
         self.fit_xgboost()
+        gc.collect()
 
+        print("Fitting LightGBM")
         self.fit_lightgbm()
+        gc.collect()

@@ -75,7 +75,7 @@ class FeatureEngineer():
             if "year" in X.columns:
                 return X["year"].astype(int)
             raise ValueError("Provide a `year` Series or include a 'year' column in X.")
-        X = df.drop(['CUSIP6', 'PERMNO', 'bankruptcy'], axis=1)
+        X = df.drop(['CUSIP6', 'bankruptcy'], axis=1)
         Y = df['bankruptcy']
         year = extract_year_series(X)
         train_mask = (year >= 1964) & (year <= 1990)

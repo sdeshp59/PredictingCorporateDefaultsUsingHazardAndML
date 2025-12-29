@@ -54,9 +54,9 @@ class PreProcessor():
         return df
     
     def read_data(self):
-        bankruptcy = pd.read_csv('data/BANKRUPTCY.csv', dtype = self.bankruptcy_config, parse_dates=['B_date']) # type: ignore
-        compustat = pd.read_csv('data/COMPUSTAT.csv')
-        crsp = pd.read_csv('data/MSF.csv', dtype = self.crsp_config, parse_dates=['B_date'])  # type: ignore
+        bankruptcy = pd.read_csv('data/BANKRUPTCY.csv', dtype = self.bankruptcy_config, parse_dates=['B_date'], low_memory=False) # type: ignore
+        compustat = pd.read_csv('data/COMPUSTAT.csv', low_memory=False)
+        crsp = pd.read_csv('data/MSF.csv', dtype = self.crsp_config, parse_dates=['DATE'], low_memory=False)  # type: ignore
         
         bankruptcy['bk_year'] = bankruptcy['B_date'].dt.year # type: ignore
         
@@ -106,4 +106,13 @@ class PreProcessor():
         df = self.customImputation(df, 'fincf', 'firm_mean')
         df = self.customImputation(df, 'ivncf', 'firm_mean')
         df = self.customImputation(df, 'dv', 'zero')
+
+        df['year'] = df['year'].astype('int16')
+
+        df['bankruptcy'] = df['bankruptcy'].astype('int8')
+
+        float_cols = df.select_dtypes(include=['float64']).columns
+        for col in float_cols:
+            df[col] = df[col].astype('float32')
+
         return df
